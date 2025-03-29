@@ -11,6 +11,7 @@ import base64
 from io import BytesIO
 from math import pi
 from sklearn.metrics import roc_curve, auc
+from sklearn.preprocessing import LabelEncoder
 
 app = Flask(__name__)
 
@@ -21,32 +22,24 @@ os.makedirs('static', exist_ok=True)
 features = ["pm25", "pm10", "no", "no2", "nox", "nh3", "so2", "co", "o3", "benzene", 
             "humidity", "wind_speed", "wind_direction", "solar_radiation", "rainfall", "air_temperature"]
 
+# Load models
+scaler = joblib.load("scaler.pkl")
+feature_names = joblib.load("feature_names.pkl")  # Load feature names used during training
+label_encoder = joblib.load("label_encoder.pkl")  # Load label encoder for classification results
+
+# Load metrics data for visualization
+metrics_df = pd.read_csv("model_metrics.csv", index_col=0)
+
 @app.route('/')
 def home():
-    return render_template('index.html', features=features)
+    return render_template('index.html', features=feature_names)  # Use feature_names
 
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        # Check if files exist
-        if not os.path.exists("scaler.pkl"):
-            return {"error": "scaler.pkl not found in deployment"}, 500
-        if not os.path.exists("label_encoder.pkl"):
-            return {"error": "label_encoder.pkl not found in deployment"}, 500
-        if not os.path.exists("model_performance_metrics.csv"):
-            return {"error": "model_performance_metrics.csv not found in deployment"}, 500
-        
-        # Load files
-        scaler = joblib.load("scaler.pkl")
-        label_encoder = joblib.load("label_encoder.pkl")
-        metrics_df = pd.read_csv("model_performance_metrics.csv", index_col=0)
-        
-        return {"message": "Files loaded successfully"}
-    except Exception as e:
-        return {"error": str(e)}, 500
-        
-        # Convert Accuracy column to percentage
-        metrics_df["Accuracy"] = (metrics_df["Accuracy"] * 100).round(2)
+        # Convert Accuracy column to percentage if it exists and is not already in percentage form
+        if 'Accuracy' in metrics_df.columns and metrics_df["Accuracy"].max() <= 1:
+            metrics_df["Accuracy"] = (metrics_df["Accuracy"] * 100).round(2)
         
         # Get input values from form or JSON
         if request.is_json:
@@ -54,13 +47,13 @@ def predict():
             input_values = data.get('features', [])
         else:
             input_values = []
-            for feature in features:
+            for feature in feature_names:
                 value = request.form.get(feature, 0)
                 input_values.append(float(value))
         
         # Check if we have the right number of features
-        if len(input_values) != len(features):
-            return jsonify({'error': f'Expected {len(features)} features, got {len(input_values)}'})
+        if len(input_values) != len(feature_names):
+            return jsonify({'error': f'Expected {len(feature_names)} features, got {len(input_values)}'})
         
         # Scale input data
         input_array = np.array(input_values).reshape(1, -1)
@@ -82,20 +75,21 @@ def predict():
             model_results = {}
             
             # Regression Model Prediction
-            if reg_file:
+            if reg_file and os.path.exists(reg_file):
                 reg_model = joblib.load(reg_file)
                 y_reg_pred = reg_model.predict(input_scaled)[0]
                 model_results["Predicted Efficiency"] = float(y_reg_pred)
             
             # Classification Model Prediction
-            clf_model = joblib.load(clf_file)
-            y_clf_pred = clf_model.predict(input_scaled)[0]
-            y_clf_label = label_encoder.inverse_transform([y_clf_pred])[0]
+            if os.path.exists(clf_file):
+                clf_model = joblib.load(clf_file)
+                y_clf_pred = clf_model.predict(input_scaled)[0]
+                y_clf_label = label_encoder.inverse_transform([y_clf_pred])[0]
+                model_results["Predicted Category"] = y_clf_label
             
-            model_results["Predicted Category"] = y_clf_label
-            
-            # Store results
-            results[model_name] = model_results
+            # Store results only if we have any predictions
+            if model_results:
+                results[model_name] = model_results
         
         # Convert results to DataFrame
         results_df = pd.DataFrame.from_dict(results, orient='index')
@@ -122,7 +116,6 @@ def predict():
         plt.close()
         
         # 3. Radar Chart
-        plt.figure(figsize=(8, 8))
         labels = metrics_df.columns.tolist()
         num_vars = len(labels)
         
@@ -179,6 +172,14 @@ def predict():
             plt.tight_layout()
             plt.savefig('static/feature_importance.png')
             plt.close()
+        else:
+            # Create an empty feature importance plot to avoid errors in template
+            plt.figure(figsize=(12, 6))
+            plt.text(0.5, 0.5, "No feature importance data available", 
+                     horizontalalignment='center', verticalalignment='center')
+            plt.axis('off')
+            plt.savefig('static/feature_importance.png')
+            plt.close()
         
         # 6. ROC Curves
         plt.figure(figsize=(15, 10))
@@ -196,9 +197,14 @@ def predict():
         # Line styles for different classes
         class_styles = ['-', '--', '-.', ':']
         
+        has_roc_data = False
         for model_name, (_, clf_file) in models.items():
+            if not os.path.exists(clf_file):
+                continue
+                
             clf_model = joblib.load(clf_file)
             if hasattr(clf_model, 'predict_proba'):
+                has_roc_data = True
                 y_clf_prob = clf_model.predict_proba(input_scaled)[0]
                 
                 # Get colormap for this model
@@ -220,31 +226,107 @@ def predict():
                              linewidth=2,
                              alpha=0.8)
         
-        # Add reference line
-        plt.plot([0, 1], [0, 1], 'k--', alpha=0.3, linewidth=1)
+        if has_roc_data:
+            # Add reference line
+            plt.plot([0, 1], [0, 1], 'k--', alpha=0.3, linewidth=1)
+            
+            # Improve appearance
+            plt.xlabel("False Positive Rate", fontsize=12)
+            plt.ylabel("True Positive Rate", fontsize=12)
+            plt.title("ROC Curves Across Models and Classes", fontsize=16)
+            plt.grid(True, linestyle='--', alpha=0.3)
+            
+            plt.legend(
+                loc='center left', 
+                bbox_to_anchor=(1, 0.5), 
+                fontsize=10,
+                frameon=True,
+                fancybox=True,
+                framealpha=0.9,
+                ncol=1
+            )
+            
+            plt.xlim([-0.01, 1.01])
+            plt.ylim([-0.01, 1.01])
+            plt.tick_params(direction='out', labelsize=10)
+            plt.tight_layout()
+        else:
+            # Create an empty ROC plot to avoid errors in template
+            plt.text(0.5, 0.5, "No ROC data available", 
+                     horizontalalignment='center', verticalalignment='center')
+            plt.axis('off')
         
-        # Improve appearance
-        plt.xlabel("False Positive Rate", fontsize=12)
-        plt.ylabel("True Positive Rate", fontsize=12)
-        plt.title("ROC Curves Across Models and Classes", fontsize=16)
-        plt.grid(True, linestyle='--', alpha=0.3)
-        
-        plt.legend(
-            loc='center left', 
-            bbox_to_anchor=(1, 0.5), 
-            fontsize=10,
-            frameon=True,
-            fancybox=True,
-            framealpha=0.9,
-            ncol=1
-        )
-        
-        plt.xlim([-0.01, 1.01])
-        plt.ylim([-0.01, 1.01])
-        plt.tick_params(direction='out', labelsize=10)
-        plt.tight_layout()
         plt.savefig('static/roc_curves.png')
         plt.close()
+        
+        # 7. Create Model Performance Metrics Table
+        plt.figure(figsize=(12, len(metrics_df) * 0.5))
+        ax = plt.subplot(111, frame_on=False)
+        ax.xaxis.set_visible(False)
+        ax.yaxis.set_visible(False)
+        table = plt.table(cellText=metrics_df.values.round(3),
+                         rowLabels=metrics_df.index,
+                         colLabels=metrics_df.columns,
+                         cellLoc='center',
+                         loc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1, 1.5)
+        plt.title('Model Performance Metrics')
+        plt.savefig('static/metrics_table.png', bbox_inches='tight')
+        plt.close()
+
+        # 8. Individual Model Radar Charts
+        metrics = metrics_df.columns.tolist()
+        num_vars = len(metrics)
+        angles = [n / float(num_vars) * 2 * pi for n in range(num_vars)]
+        angles += angles[:1]
+
+        for model in metrics_df.index:
+            fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+            values = metrics_df.loc[model].tolist()
+            values += values[:1]
+            ax.plot(angles, values, linewidth=2, linestyle='solid', label=model)
+            ax.fill(angles, values, alpha=0.3)
+            ax.set_xticks(angles[:-1])
+            ax.set_xticklabels(metrics)
+            ax.set_title(f"{model} Performance Radar")
+            plt.savefig(f'static/{model}_radar.png')
+            plt.close()
+
+        # 9. Individual Metric Analysis
+        metric_plots = []
+        metrics = metrics_df.columns
+        for metric in metrics:
+            plt.figure(figsize=(10, 5))
+            sns.barplot(x=metrics_df.index, y=metrics_df[metric])
+            plt.title(f"{metric} Comparison Across Models")
+            plt.xlabel("Models")
+            plt.ylabel(metric)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            filename = f'static/{metric}_comparison.png'
+            plt.savefig(filename)
+            plt.close()
+            metric_plots.append((metric, f'{metric}_comparison.png'))
+
+        # 10. Individual Feature Analysis
+        feature_plots = []
+        if existing_files:
+            for file in existing_files:
+                model_name = file.replace('_feature_importance.csv', '')
+                df_importance = pd.read_csv(file)
+                plt.figure(figsize=(10, 5))
+                sns.barplot(x=df_importance["Feature"], y=df_importance["Importance"])
+                plt.title(f"Feature Importance for {model_name}")
+                plt.xlabel("Feature")
+                plt.ylabel("Importance")
+                plt.xticks(rotation=45)
+                plt.tight_layout()
+                filename = f'static/{model_name}_features.png'
+                plt.savefig(filename)
+                plt.close()
+                feature_plots.append((model_name, f'{model_name}_features.png'))
         
         # Prepare response
         plot_paths = {
@@ -253,7 +335,11 @@ def predict():
             'radar_chart': 'radar_chart.png',
             'performance_trends': 'performance_trends.png',
             'feature_importance': 'feature_importance.png',
-            'roc_curves': 'roc_curves.png'
+            'roc_curves': 'roc_curves.png',
+            'metrics_table': 'metrics_table.png',
+            'individual_radar_charts': {model: f'{model}_radar.png' for model in metrics_df.index},
+            'metric_comparisons': {metric: plot for metric, plot in metric_plots},
+            'feature_analyses': {model: plot for model, plot in feature_plots}
         }
         
         # Return response based on request type
@@ -371,6 +457,16 @@ results_html = '''
             </div>
         </div>
         
+        <!-- Model Performance Metrics Table -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h3>Model Performance Metrics Table</h3>
+            </div>
+            <div class="card-body">
+                <img src="{{ url_for('static', filename=plot_paths.metrics_table) }}" alt="Metrics Table" class="img-fluid">
+            </div>
+        </div>
+        
         <!-- Visualizations -->
         <div class="card mb-4">
             <div class="card-header">
@@ -402,6 +498,57 @@ results_html = '''
                         <h4>ROC Curves</h4>
                         <img src="{{ url_for('static', filename=plot_paths.roc_curves) }}" alt="ROC Curves">
                     </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Individual Model Radar Charts -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h3>Individual Model Radar Charts</h3>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    {% for model, chart_path in plot_paths.individual_radar_charts.items() %}
+                    <div class="col-md-6 mb-4">
+                        <h4>{{ model }}</h4>
+                        <img src="{{ url_for('static', filename=chart_path) }}" alt="{{ model }} Radar Chart">
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Individual Metric Analysis -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h3>Individual Metric Analysis</h3>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    {% for metric, chart_path in plot_paths.metric_comparisons.items() %}
+                    <div class="col-md-6 mb-4">
+                        <h4>{{ metric }}</h4>
+                        <img src="{{ url_for('static', filename=chart_path) }}" alt="{{ metric }} Comparison">
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+
+        <!-- Individual Feature Analysis -->
+        <div class="card mb-4">
+            <div class="card-header">
+                <h3>Individual Feature Analysis</h3>
+            </div>
+            <div class="card-body">
+                <div class="row">
+                    {% for model, chart_path in plot_paths.feature_analyses.items() %}
+                    <div class="col-md-6 mb-4">
+                        <h4>{{ model }}</h4>
+                        <img src="{{ url_for('static', filename=chart_path) }}" alt="{{ model }} Feature Importance">
+                    </div>
+                    {% endfor %}
                 </div>
             </div>
         </div>
