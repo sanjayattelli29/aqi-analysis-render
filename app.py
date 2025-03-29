@@ -1,22 +1,18 @@
+
 from flask import Flask, request, jsonify, render_template
 import pandas as pd
 import numpy as np
 import joblib
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')  # For server environments
-import seaborn as sns
 import os
-import base64
-from io import BytesIO
+import json
 from math import pi
 from sklearn.metrics import roc_curve, auc
 from sklearn.preprocessing import LabelEncoder
 
 app = Flask(__name__)
 
-# Create static directory for plots
-os.makedirs('static', exist_ok=True)
+# Create templates directory
+os.makedirs('templates', exist_ok=True)
 
 # Define feature columns
 features = ["pm25", "pm10", "no", "no2", "nox", "nh3", "so2", "co", "o3", "benzene", 
@@ -24,7 +20,7 @@ features = ["pm25", "pm10", "no", "no2", "nox", "nh3", "so2", "co", "o3", "benze
 
 # Load models
 scaler = joblib.load("scaler.pkl")
-feature_names = joblib.load("feature_names.pkl")  # Load feature names used during training
+feature_names = features  # Use the feature names defined above
 label_encoder = joblib.load("label_encoder.pkl")  # Load label encoder for classification results
 
 # Load metrics data for visualization
@@ -32,7 +28,7 @@ metrics_df = pd.read_csv("model_metrics.csv", index_col=0)
 
 @app.route('/')
 def home():
-    return render_template('index.html', features=feature_names)  # Use feature_names
+    return render_template('index.html', features=features)
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -47,17 +43,17 @@ def predict():
             input_values = data.get('features', [])
         else:
             input_values = []
-            for feature in feature_names:
+            for feature in features:
                 value = request.form.get(feature, 0)
                 input_values.append(float(value))
         
         # Check if we have the right number of features
-        if len(input_values) != len(feature_names):
-            return jsonify({'error': f'Expected {len(feature_names)} features, got {len(input_values)}'})
+        if len(input_values) != len(features):
+            return jsonify({'error': f'Expected {len(features)} features, got {len(input_values)}'})
         
-        # Scale input data
-        input_array = np.array(input_values).reshape(1, -1)
-        input_scaled = scaler.transform(input_array)
+        # Scale input data - create a DataFrame with feature names to avoid the warning
+        input_df = pd.DataFrame([input_values], columns=features)
+        input_scaled = scaler.transform(input_df)
         
         # Define models with exact filenames
         models = {
@@ -77,13 +73,21 @@ def predict():
             # Regression Model Prediction
             if reg_file and os.path.exists(reg_file):
                 reg_model = joblib.load(reg_file)
-                y_reg_pred = reg_model.predict(input_scaled)[0]
+                # For LightGBM regressor, we need to pass a DataFrame with feature names
+                if model_name == "LightGBM":
+                    y_reg_pred = reg_model.predict(pd.DataFrame(input_scaled, columns=features))[0]
+                else:
+                    y_reg_pred = reg_model.predict(input_scaled)[0]
                 model_results["Predicted Efficiency"] = float(y_reg_pred)
             
             # Classification Model Prediction
             if os.path.exists(clf_file):
                 clf_model = joblib.load(clf_file)
-                y_clf_pred = clf_model.predict(input_scaled)[0]
+                # For LightGBM classifier, we need to pass a DataFrame with feature names
+                if model_name == "LightGBM":
+                    y_clf_pred = clf_model.predict(pd.DataFrame(input_scaled, columns=features))[0]
+                else:
+                    y_clf_pred = clf_model.predict(input_scaled)[0]
                 y_clf_label = label_encoder.inverse_transform([y_clf_pred])[0]
                 model_results["Predicted Category"] = y_clf_label
             
@@ -91,64 +95,60 @@ def predict():
             if model_results:
                 results[model_name] = model_results
         
-        # Convert results to DataFrame
+        # Convert results to DataFrame for further processing
         results_df = pd.DataFrame.from_dict(results, orient='index')
         results_df.to_csv("model_test_results.csv")
         
-        # Generate visualization plots
-        # 1. Performance Bar Chart
-        plt.figure(figsize=(12, 6))
-        metrics_df.plot(kind='bar', figsize=(12, 6), title="Model Performance Analysis")
-        plt.xlabel("Models")
-        plt.ylabel("Metric Scores")
-        plt.xticks(rotation=45)
-        plt.legend(loc='best')
-        plt.tight_layout()
-        plt.savefig('static/performance_barchart.png')
-        plt.close()
+        # Prepare visualization data in JSON format
+        visualization_data = {}
         
-        # 2. Metrics Heatmap
-        plt.figure(figsize=(10, 6))
-        sns.heatmap(metrics_df.corr(), annot=True, cmap='coolwarm', fmt='.2f')
-        plt.title("Performance Metrics Correlation Heatmap")
-        plt.tight_layout()
-        plt.savefig('static/metrics_heatmap.png')
-        plt.close()
+        # 1. Performance Bar Chart Data
+        visualization_data['performance_barchart'] = {
+            'data': metrics_df.to_dict('list'),
+            'models': metrics_df.index.tolist(),
+            'metrics': metrics_df.columns.tolist(),
+            'title': 'Model Performance Analysis'
+        }
         
-        # 3. Radar Chart
+        # 2. Metrics Heatmap Data
+        correlation_matrix = metrics_df.corr().round(2)
+        visualization_data['metrics_heatmap'] = {
+            'data': correlation_matrix.to_dict('records'),
+            'labels': correlation_matrix.columns.tolist(),
+            'title': 'Performance Metrics Correlation Heatmap'
+        }
+        
+        # 3. Radar Chart Data
         labels = metrics_df.columns.tolist()
         num_vars = len(labels)
         
         angles = [n / float(num_vars) * 2 * pi for n in range(num_vars)]
-        angles += angles[:1]
+        angles_list = [round(angle, 4) for angle in angles]
         
-        fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+        radar_data = {
+            'labels': labels,
+            'angles': angles_list,
+            'models': {}
+        }
         
         for model in metrics_df.index:
             values = metrics_df.loc[model].tolist()
-            values += values[:1]
-            ax.plot(angles, values, linewidth=2, linestyle='solid', label=model)
-            ax.fill(angles, values, alpha=0.3)
+            radar_data['models'][model] = values
         
-        ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(labels)
-        plt.title("Model Performance Radar Chart")
-        plt.legend(loc='upper right', bbox_to_anchor=(1.2, 1.1))
-        plt.savefig('static/radar_chart.png')
-        plt.close()
+        visualization_data['radar_chart'] = {
+            'data': radar_data,
+            'title': 'Model Performance Radar Chart'
+        }
         
-        # 4. Performance Trends
-        plt.figure(figsize=(12, 6))
-        metrics_df.T.plot(kind='line', figsize=(12, 6), marker='o', title="Model Performance Trends")
-        plt.xlabel("Metrics")
-        plt.ylabel("Scores")
-        plt.xticks(rotation=45)
-        plt.legend(loc='best')
-        plt.tight_layout()
-        plt.savefig('static/performance_trends.png')
-        plt.close()
+        # 4. Performance Trends Data
+        visualization_data['performance_trends'] = {
+            'data': metrics_df.T.to_dict('list'),
+            'metrics': metrics_df.columns.tolist(),
+            'models': metrics_df.index.tolist(),
+            'title': 'Model Performance Trends'
+        }
         
-        # 5. Feature Importance Plots
+        # 5. Feature Importance Data
         feature_importance_files = [
             "RandomForest_feature_importance.csv",
             "KNN_feature_importance.csv",
@@ -161,43 +161,25 @@ def predict():
         # Check which files actually exist
         existing_files = [f for f in feature_importance_files if os.path.exists(f)]
         
+        feature_importance_data = {}
         if existing_files:
-            plt.figure(figsize=(12, 6))
             for file in existing_files:
+                model_name = file.replace('_feature_importance.csv', '')
                 df_importance = pd.read_csv(file)
-                sns.barplot(x=df_importance["Feature"], y=df_importance["Importance"], label=file.replace("_feature_importance.csv", ""))
-            plt.xticks(rotation=45)
-            plt.title("Feature Importance Across Models")
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig('static/feature_importance.png')
-            plt.close()
-        else:
-            # Create an empty feature importance plot to avoid errors in template
-            plt.figure(figsize=(12, 6))
-            plt.text(0.5, 0.5, "No feature importance data available", 
-                     horizontalalignment='center', verticalalignment='center')
-            plt.axis('off')
-            plt.savefig('static/feature_importance.png')
-            plt.close()
+                feature_importance_data[model_name] = {
+                    'features': df_importance["Feature"].tolist(),
+                    'importance': df_importance["Importance"].tolist()
+                }
+            
+            visualization_data['feature_importance'] = {
+                'data': feature_importance_data,
+                'title': 'Feature Importance Across Models'
+            }
         
-        # 6. ROC Curves
-        plt.figure(figsize=(15, 10))
-        
-        # Color schemes for different models
-        color_schemes = {
-            'RandomForest': plt.cm.Blues,
-            'KNN': plt.cm.Reds,
-            'NaiveBayes': plt.cm.Greens,
-            'SVM': plt.cm.Oranges,
-            'LightGBM': plt.cm.Purples,
-            'MLP': plt.cm.Greys
-        }
-        
-        # Line styles for different classes
-        class_styles = ['-', '--', '-.', ':']
-        
+        # 6. ROC Curves Data
+        roc_data = {}
         has_roc_data = False
+        
         for model_name, (_, clf_file) in models.items():
             if not os.path.exists(clf_file):
                 continue
@@ -205,155 +187,99 @@ def predict():
             clf_model = joblib.load(clf_file)
             if hasattr(clf_model, 'predict_proba'):
                 has_roc_data = True
-                y_clf_prob = clf_model.predict_proba(input_scaled)[0]
                 
-                # Get colormap for this model
-                cmap = color_schemes.get(model_name, plt.cm.viridis)
+                # Use DataFrame with feature names for LightGBM
+                if model_name == "LightGBM":
+                    y_clf_prob = clf_model.predict_proba(pd.DataFrame(input_scaled, columns=features))[0]
+                else:
+                    y_clf_prob = clf_model.predict_proba(input_scaled)[0]
                 
+                model_roc_data = []
                 for i in range(len(y_clf_prob)):
-                    fpr, tpr, _ = roc_curve([1 if j == i else 0 for j in range(len(y_clf_prob))], 
-                                          [1 if j == i else 0 for j in range(len(y_clf_prob))])
+                    fpr, tpr, _ = roc_curve(
+                        [1 if j == i else 0 for j in range(len(y_clf_prob))], 
+                        [1 if j == i else 0 for j in range(len(y_clf_prob))]
+                    )
                     roc_auc = auc(fpr, tpr)
                     
-                    # Calculate color based on model type
-                    color = cmap(0.3 + 0.7 * ((i + 1) / len(y_clf_prob)))
-                    
-                    # Plot with consistent styling per class
-                    plt.plot(fpr, tpr, 
-                             label=f"{model_name} (Class {i}, AUC = {roc_auc:.2f})",
-                             linestyle=class_styles[i % len(class_styles)],
-                             color=color,
-                             linewidth=2,
-                             alpha=0.8)
+                    model_roc_data.append({
+                        'class': i,
+                        'auc': round(roc_auc, 2),
+                        'fpr': fpr.tolist(),
+                        'tpr': tpr.tolist()
+                    })
+                
+                roc_data[model_name] = model_roc_data
         
         if has_roc_data:
-            # Add reference line
-            plt.plot([0, 1], [0, 1], 'k--', alpha=0.3, linewidth=1)
-            
-            # Improve appearance
-            plt.xlabel("False Positive Rate", fontsize=12)
-            plt.ylabel("True Positive Rate", fontsize=12)
-            plt.title("ROC Curves Across Models and Classes", fontsize=16)
-            plt.grid(True, linestyle='--', alpha=0.3)
-            
-            plt.legend(
-                loc='center left', 
-                bbox_to_anchor=(1, 0.5), 
-                fontsize=10,
-                frameon=True,
-                fancybox=True,
-                framealpha=0.9,
-                ncol=1
-            )
-            
-            plt.xlim([-0.01, 1.01])
-            plt.ylim([-0.01, 1.01])
-            plt.tick_params(direction='out', labelsize=10)
-            plt.tight_layout()
-        else:
-            # Create an empty ROC plot to avoid errors in template
-            plt.text(0.5, 0.5, "No ROC data available", 
-                     horizontalalignment='center', verticalalignment='center')
-            plt.axis('off')
+            visualization_data['roc_curves'] = {
+                'data': roc_data,
+                'title': 'ROC Curves Across Models and Classes'
+            }
         
-        plt.savefig('static/roc_curves.png')
-        plt.close()
-        
-        # 7. Create Model Performance Metrics Table
-        plt.figure(figsize=(12, len(metrics_df) * 0.5))
-        ax = plt.subplot(111, frame_on=False)
-        ax.xaxis.set_visible(False)
-        ax.yaxis.set_visible(False)
-        table = plt.table(cellText=metrics_df.values.round(3),
-                         rowLabels=metrics_df.index,
-                         colLabels=metrics_df.columns,
-                         cellLoc='center',
-                         loc='center')
-        table.auto_set_font_size(False)
-        table.set_fontsize(10)
-        table.scale(1, 1.5)
-        plt.title('Model Performance Metrics')
-        plt.savefig('static/metrics_table.png', bbox_inches='tight')
-        plt.close()
-
-        # 8. Individual Model Radar Charts
+        # 7. Individual Model Radar Charts Data
+        individual_radar_data = {}
         metrics = metrics_df.columns.tolist()
         num_vars = len(metrics)
         angles = [n / float(num_vars) * 2 * pi for n in range(num_vars)]
-        angles += angles[:1]
+        angles_list = [round(angle, 4) for angle in angles]
 
         for model in metrics_df.index:
-            fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
             values = metrics_df.loc[model].tolist()
-            values += values[:1]
-            ax.plot(angles, values, linewidth=2, linestyle='solid', label=model)
-            ax.fill(angles, values, alpha=0.3)
-            ax.set_xticks(angles[:-1])
-            ax.set_xticklabels(metrics)
-            ax.set_title(f"{model} Performance Radar")
-            plt.savefig(f'static/{model}_radar.png')
-            plt.close()
-
-        # 9. Individual Metric Analysis
-        metric_plots = []
+            individual_radar_data[model] = {
+                'metrics': metrics,
+                'angles': angles_list,
+                'values': values,
+                'title': f"{model} Performance Radar"
+            }
+        
+        visualization_data['individual_radar_charts'] = individual_radar_data
+        
+        # 8. Individual Metric Analysis Data
+        metric_comparison_data = {}
         metrics = metrics_df.columns
         for metric in metrics:
-            plt.figure(figsize=(10, 5))
-            sns.barplot(x=metrics_df.index, y=metrics_df[metric])
-            plt.title(f"{metric} Comparison Across Models")
-            plt.xlabel("Models")
-            plt.ylabel(metric)
-            plt.xticks(rotation=45)
-            plt.tight_layout()
-            filename = f'static/{metric}_comparison.png'
-            plt.savefig(filename)
-            plt.close()
-            metric_plots.append((metric, f'{metric}_comparison.png'))
-
-        # 10. Individual Feature Analysis
-        feature_plots = []
+            metric_comparison_data[metric] = {
+                'models': metrics_df.index.tolist(),
+                'values': metrics_df[metric].tolist(),
+                'title': f"{metric} Comparison Across Models"
+            }
+        
+        visualization_data['metric_comparisons'] = metric_comparison_data
+        
+        # 9. Individual Feature Analysis Data
+        feature_analyses_data = {}
         if existing_files:
             for file in existing_files:
                 model_name = file.replace('_feature_importance.csv', '')
                 df_importance = pd.read_csv(file)
-                plt.figure(figsize=(10, 5))
-                sns.barplot(x=df_importance["Feature"], y=df_importance["Importance"])
-                plt.title(f"Feature Importance for {model_name}")
-                plt.xlabel("Feature")
-                plt.ylabel("Importance")
-                plt.xticks(rotation=45)
-                plt.tight_layout()
-                filename = f'static/{model_name}_features.png'
-                plt.savefig(filename)
-                plt.close()
-                feature_plots.append((model_name, f'{model_name}_features.png'))
+                feature_analyses_data[model_name] = {
+                    'features': df_importance["Feature"].tolist(),
+                    'importance': df_importance["Importance"].tolist(),
+                    'title': f"Feature Importance for {model_name}"
+                }
         
-        # Prepare response
-        plot_paths = {
-            'performance_barchart': 'performance_barchart.png',
-            'metrics_heatmap': 'metrics_heatmap.png',
-            'radar_chart': 'radar_chart.png',
-            'performance_trends': 'performance_trends.png',
-            'feature_importance': 'feature_importance.png',
-            'roc_curves': 'roc_curves.png',
-            'metrics_table': 'metrics_table.png',
-            'individual_radar_charts': {model: f'{model}_radar.png' for model in metrics_df.index},
-            'metric_comparisons': {metric: plot for metric, plot in metric_plots},
-            'feature_analyses': {model: plot for model, plot in feature_plots}
-        }
+        visualization_data['feature_analyses'] = feature_analyses_data
+        
+        # Convert metrics DataFrame to a format suitable for the results template
+        metrics_dict = metrics_df.to_dict('records')
+        metrics_with_index = {}
+        for i, row in enumerate(metrics_dict):
+            metrics_with_index[metrics_df.index[i]] = row
         
         # Return response based on request type
         if request.is_json:
             return jsonify({
                 'results': results,
+                'visualization_data': visualization_data,
                 'success': True
             })
         else:
             return render_template(
                 'results.html', 
                 results=results, 
-                metrics=metrics_df.to_dict(),
-                plot_paths=plot_paths
+                metrics=metrics_with_index,
+                visualization_data=json.dumps(visualization_data)
             )
     
     except Exception as e:
@@ -363,9 +289,6 @@ def predict():
             return jsonify({'error': error_message, 'success': False})
         else:
             return render_template('error.html', error=error_message)
-
-# Create basic templates directory and templates if they don't exist
-os.makedirs('templates', exist_ok=True)
 
 # Create index.html
 index_html = '''
@@ -409,17 +332,26 @@ index_html = '''
 </html>
 '''
 
-# Create results.html
+# Create results.html with Chart.js visualization
 results_html = '''
 <!DOCTYPE html>
 <html>
 <head>
     <title>Analysis Results</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-chart-matrix@1.1.1/dist/chartjs-chart-matrix.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-datalabels@2.0.0"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@2.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     <style>
         body { padding: 20px; }
         .container { max-width: 1200px; }
-        img { max-width: 100%; }
+        .chart-container { 
+            position: relative;
+            height: 400px;
+            width: 100%;
+            margin-bottom: 30px;
+        }
     </style>
 </head>
 <body>
@@ -463,7 +395,28 @@ results_html = '''
                 <h3>Model Performance Metrics Table</h3>
             </div>
             <div class="card-body">
-                <img src="{{ url_for('static', filename=plot_paths.metrics_table) }}" alt="Metrics Table" class="img-fluid">
+                <div class="table-responsive">
+                    <table class="table table-striped">
+                        <thead>
+                            <tr>
+                                <th>Model</th>
+                                {% for metric in metrics[metrics.keys()|list|first].keys() %}
+                                <th>{{ metric }}</th>
+                                {% endfor %}
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for model, metric_values in metrics.items() %}
+                            <tr>
+                                <td><strong>{{ model }}</strong></td>
+                                {% for metric, value in metric_values.items() %}
+                                <td>{{ value }}</td>
+                                {% endfor %}
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
         
@@ -476,27 +429,39 @@ results_html = '''
                 <div class="row">
                     <div class="col-md-6 mb-4">
                         <h4>Performance Bar Chart</h4>
-                        <img src="{{ url_for('static', filename=plot_paths.performance_barchart) }}" alt="Performance Bar Chart">
+                        <div class="chart-container">
+                            <canvas id="performanceBarChart"></canvas>
+                        </div>
                     </div>
                     <div class="col-md-6 mb-4">
                         <h4>Metrics Heatmap</h4>
-                        <img src="{{ url_for('static', filename=plot_paths.metrics_heatmap) }}" alt="Metrics Heatmap">
+                        <div class="chart-container">
+                            <canvas id="metricsHeatmap"></canvas>
+                        </div>
                     </div>
                     <div class="col-md-6 mb-4">
                         <h4>Radar Chart</h4>
-                        <img src="{{ url_for('static', filename=plot_paths.radar_chart) }}" alt="Radar Chart">
+                        <div class="chart-container">
+                            <canvas id="radarChart"></canvas>
+                        </div>
                     </div>
                     <div class="col-md-6 mb-4">
                         <h4>Performance Trends</h4>
-                        <img src="{{ url_for('static', filename=plot_paths.performance_trends) }}" alt="Performance Trends">
+                        <div class="chart-container">
+                            <canvas id="performanceTrends"></canvas>
+                        </div>
                     </div>
                     <div class="col-md-6 mb-4">
                         <h4>Feature Importance</h4>
-                        <img src="{{ url_for('static', filename=plot_paths.feature_importance) }}" alt="Feature Importance">
+                        <div class="chart-container">
+                            <canvas id="featureImportance"></canvas>
+                        </div>
                     </div>
                     <div class="col-md-6 mb-4">
                         <h4>ROC Curves</h4>
-                        <img src="{{ url_for('static', filename=plot_paths.roc_curves) }}" alt="ROC Curves">
+                        <div class="chart-container">
+                            <canvas id="rocCurves"></canvas>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -508,13 +473,8 @@ results_html = '''
                 <h3>Individual Model Radar Charts</h3>
             </div>
             <div class="card-body">
-                <div class="row">
-                    {% for model, chart_path in plot_paths.individual_radar_charts.items() %}
-                    <div class="col-md-6 mb-4">
-                        <h4>{{ model }}</h4>
-                        <img src="{{ url_for('static', filename=chart_path) }}" alt="{{ model }} Radar Chart">
-                    </div>
-                    {% endfor %}
+                <div class="row" id="individualRadarCharts">
+                    <!-- Individual radar charts will be inserted here -->
                 </div>
             </div>
         </div>
@@ -525,13 +485,8 @@ results_html = '''
                 <h3>Individual Metric Analysis</h3>
             </div>
             <div class="card-body">
-                <div class="row">
-                    {% for metric, chart_path in plot_paths.metric_comparisons.items() %}
-                    <div class="col-md-6 mb-4">
-                        <h4>{{ metric }}</h4>
-                        <img src="{{ url_for('static', filename=chart_path) }}" alt="{{ metric }} Comparison">
-                    </div>
-                    {% endfor %}
+                <div class="row" id="metricComparisonCharts">
+                    <!-- Individual metric charts will be inserted here -->
                 </div>
             </div>
         </div>
@@ -542,13 +497,8 @@ results_html = '''
                 <h3>Individual Feature Analysis</h3>
             </div>
             <div class="card-body">
-                <div class="row">
-                    {% for model, chart_path in plot_paths.feature_analyses.items() %}
-                    <div class="col-md-6 mb-4">
-                        <h4>{{ model }}</h4>
-                        <img src="{{ url_for('static', filename=chart_path) }}" alt="{{ model }} Feature Importance">
-                    </div>
-                    {% endfor %}
+                <div class="row" id="featureAnalysisCharts">
+                    <!-- Individual feature charts will be inserted here -->
                 </div>
             </div>
         </div>
@@ -557,6 +507,498 @@ results_html = '''
             <a href="/" class="btn btn-primary">Back to Input Form</a>
         </div>
     </div>
+
+    <script>
+        // Parse visualization data from server
+        const visualizationData = JSON.parse('{{ visualization_data|safe }}');
+        
+        // Helper function to generate random colors with transparency
+        function generateColors(count, alpha = 1) {
+            const colors = [];
+            for(let i = 0; i < count; i++) {
+                const r = Math.floor(Math.random() * 255);
+                const g = Math.floor(Math.random() * 255);
+                const b = Math.floor(Math.random() * 255);
+                colors.push(`rgba(${r}, ${g}, ${b}, ${alpha})`);
+            }
+            return colors;
+        }
+        
+        // Generate color palette for models
+        const modelColors = {};
+        const models = Object.keys(visualizationData.performance_barchart.data);
+        const modelColorPalette = generateColors(models.length);
+        models.forEach((model, index) => {
+            modelColors[model] = modelColorPalette[index];
+        });
+        
+        // 1. Performance Bar Chart
+        const performanceBarChartData = visualizationData.performance_barchart;
+        const performanceBarChart = new Chart(
+            document.getElementById('performanceBarChart').getContext('2d'),
+            {
+                type: 'bar',
+                data: {
+                    labels: performanceBarChartData.models,
+                    datasets: performanceBarChartData.metrics.map((metric, index) => ({
+                        label: metric,
+                        data: performanceBarChartData.models.map(model => performanceBarChartData.data[model][metric]),
+                        backgroundColor: generateColors(1)[0],
+                        borderColor: 'rgba(0, 0, 0, 1)',
+                        borderWidth: 1
+                    }))
+                },
+                options: {
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: performanceBarChartData.title
+                        },
+                        legend: {
+                            position: 'top',
+                        }
+                    },
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: true
+                        }
+                    }
+                }
+            }
+        );
+        
+        // 2. Metrics Heatmap (using regular Chart.js)
+        const metricsHeatmapData = visualizationData.metrics_heatmap;
+        const heatmapLabels = metricsHeatmapData.labels;
+        
+        // Create a custom heatmap using regular Chart.js
+        const heatmapDataValues = [];
+        const heatmapBackgroundColors = [];
+        
+        for (let i = 0; i < heatmapLabels.length; i++) {
+            for (let j = 0; j < heatmapLabels.length; j++) {
+                const value = metricsHeatmapData.data[i][heatmapLabels[j]];
+                heatmapDataValues.push(value);
+                
+                // Generate color based on correlation value (-1 to 1)
+                const normalizedValue = (value + 1) / 2; // Convert from [-1,1] to [0,1]
+                const r = normalizedValue < 0.5 ? 255 : Math.floor(255 * (1 - normalizedValue) * 2);
+                const b = normalizedValue > 0.5 ? 255 : Math.floor(255 * normalizedValue * 2);
+                const g = 128;
+                heatmapBackgroundColors.push(`rgba(${r}, ${g}, ${b}, 0.8)`);
+            }
+        }
+        
+        const metricsHeatmap = new Chart(
+            document.getElementById('metricsHeatmap').getContext('2d'),
+            {
+                type: 'bar',
+                data: {
+                    labels: Array.from({ length: heatmapLabels.length * heatmapLabels.length }, (_, i) => {
+                        const row = Math.floor(i / heatmapLabels.length);
+                        const col = i % heatmapLabels.length;
+                        return `${heatmapLabels[row]} / ${heatmapLabels[col]}`;
+                    }),
+                    datasets: [{
+                        data: heatmapDataValues,
+                        backgroundColor: heatmapBackgroundColors,
+                        barPercentage: 1.0,
+                        categoryPercentage: 1.0
+                    }]
+                },
+                options: {
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: metricsHeatmapData.title
+                        },
+                        legend: {
+                            display: false
+                        },
+                        tooltip: {
+                            callbacks: {
+                                title: function(context) {
+                                    const index = context[0].dataIndex;
+                                    const row = Math.floor(index / heatmapLabels.length);
+                                    const col = index % heatmapLabels.length;
+                                    return `${heatmapLabels[row]} / ${heatmapLabels[col]}`;
+                                },
+                                label: function(context) {
+                                    return `Value: ${context.raw.toFixed(2)}`;
+                                }
+                            }
+                        }
+                    },
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    indexAxis: 'y',
+                    scales: {
+                        x: {
+                            display: false
+                        },
+                        y: {
+                            display: false
+                        }
+                    }
+                }
+            }
+        );
+        
+        // 3. Radar Chart
+        const radarChartData = visualizationData.radar_chart;
+        const radarChart = new Chart(
+            document.getElementById('radarChart').getContext('2d'),
+            {
+                type: 'radar',
+                data: {
+                    labels: radarChartData.data.labels,
+                    datasets: Object.keys(radarChartData.data.models).map((model, index) => ({
+                        label: model,
+                        data: radarChartData.data.models[model],
+                        backgroundColor: `${modelColors[model].replace('1)', '0.2)')}`,
+                        borderColor: modelColors[model],
+                        borderWidth: 2,
+                        pointBackgroundColor: modelColors[model],
+                        pointRadius: 3
+                    }))
+                },
+                options: {
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: radarChartData.title
+                        }
+                    },
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        r: {
+                            angleLines: {
+                                display: true
+                            },
+                            min: 0
+                        }
+                    }
+                }
+            }
+        );
+        
+        // 4. Performance Trends
+        const performanceTrendsData = visualizationData.performance_trends;
+        const performanceTrends = new Chart(
+            document.getElementById('performanceTrends').getContext('2d'),
+            {
+                type: 'line',
+                data: {
+                    labels: performanceTrendsData.metrics,
+                    datasets: performanceTrendsData.models.map((model, index) => ({
+                        label: model,
+                        data: performanceTrendsData.metrics.map(metric => performanceTrendsData.data[metric][model]),
+                        borderColor: modelColors[model],
+                        backgroundColor: `${modelColors[model].replace('1)', '0.2)')}`,
+                        borderWidth: 2,
+                        tension: 0.3,
+                        fill: false,
+                        pointRadius: 4
+                    }))
+                },
+                options: {
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: performanceTrendsData.title
+                        }
+                    },
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {
+                            beginAtZero: false
+                        }
+                    }
+                }
+            }
+        );
+        
+        // 5. Feature Importance
+        if (visualizationData.feature_importance) {
+            const featureImportanceData = visualizationData.feature_importance;
+            
+            // Combine all models' feature importance data
+            const allFeatures = new Set();
+            Object.values(featureImportanceData.data).forEach(modelData => {
+                modelData.features.forEach(feature => allFeatures.add(feature));
+            });
+            
+            const featureList = Array.from(allFeatures);
+            
+            // Create datasets for each model
+            const datasets = Object.keys(featureImportanceData.data).map((model, index) => {
+                const modelData = featureImportanceData.data[model];
+                
+                // Create array with all features, filling in zeros where the model doesn't have data
+                const importanceValues = featureList.map(feature => {
+                    const featureIndex = modelData.features.indexOf(feature);
+                    return featureIndex >= 0 ? modelData.importance[featureIndex] : 0;
+                });
+                
+                return {
+                    label: model,
+                    data: importanceValues,
+                    backgroundColor: modelColors[model],
+                    borderColor: 'rgba(0, 0, 0, 1)',
+                    borderWidth: 1
+                };
+            });
+            
+            const featureImportance = new Chart(
+                document.getElementById('featureImportance').getContext('2d'),
+                {
+                    type: 'bar',
+                    data: {
+                        labels: featureList,
+                        datasets: datasets
+                    },
+                    options: {
+                        plugins: {
+                            title: {
+                                display: true,
+                                text: featureImportanceData.title
+                            }
+                        },
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        scales: {
+                            y: {
+                                beginAtZero: true
+                            },
+                            x: {
+                                ticks: {
+                                    autoSkip: false,
+                                    maxRotation: 90,
+                                    minRotation: 45
+                                }
+                            }
+                        }
+                    }
+                }
+            );
+        }   
+         
+        // 6. ROC Curves
+if (visualizationData.roc_curves) {
+    const rocCurvesData = visualizationData.roc_curves;
+
+    // Create datasets for each model's ROC curve
+    const datasets = [];
+    Object.keys(rocCurvesData.data).forEach((model) => {
+        rocCurvesData.data[model].forEach((classData) => {
+            datasets.push({
+                label: `${model} (Class ${classData.class}, AUC = ${classData.auc})`,
+                data: classData.fpr.map((fpr, i) => ({ x: fpr, y: classData.tpr[i] })),
+                borderColor: `${modelColors[model].replace('1)', '0.8)')}`,
+                backgroundColor: 'transparent',
+                borderWidth: 2,
+                pointRadius: 0,
+                lineTension: 0.4
+            });
+        });
+    });
+
+    // Add reference line
+    datasets.push({
+        label: 'Reference Line',
+        data: [
+            { x: 0, y: 0 },
+            { x: 1, y: 1 }
+        ],
+        borderColor: 'rgba(0, 0, 0, 0.3)',
+        borderWidth: 1,
+        borderDash: [5, 5],
+        pointRadius: 0,
+        backgroundColor: 'transparent'
+    });
+
+    // Initialize the ROC curve chart
+    new Chart(
+        document.getElementById('rocCurves').getContext('2d'),
+        {
+            type: 'scatter',
+            data: { datasets: datasets },
+            options: {
+                plugins: {
+                    title: {
+                        display: true,
+                        text: rocCurvesData.title
+                    }
+                },
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    x: {
+                        title: { display: true, text: 'False Positive Rate' },
+                        min: 0, max: 1
+                    },
+                    y: {
+                        title: { display: true, text: 'True Positive Rate' },
+                        min: 0, max: 1
+                    }
+                }
+            }
+        }
+    );
+}
+
+// 7. Individual Model Radar Charts
+const individualRadarChartContainer = document.getElementById('individualRadarCharts');
+if (visualizationData.individual_radar_charts) {
+    Object.keys(visualizationData.individual_radar_charts).forEach(model => {
+        const modelData = visualizationData.individual_radar_charts[model];
+        
+        const colDiv = document.createElement('div');
+        colDiv.className = 'col-md-4 mb-4';
+        
+        const canvasContainer = document.createElement('div');
+        canvasContainer.className = 'chart-container';
+        
+        const canvas = document.createElement('canvas');
+        canvas.id = `radarChart_${model}`;
+        
+        canvasContainer.appendChild(canvas);
+        colDiv.appendChild(document.createElement('h5')).textContent = modelData.title;
+        colDiv.appendChild(canvasContainer);
+        individualRadarChartContainer.appendChild(colDiv);
+
+        new Chart(
+            canvas.getContext('2d'),
+            {
+                type: 'radar',
+                data: {
+                    labels: modelData.metrics,
+                    datasets: [{
+                        label: model,
+                        data: modelData.values,
+                        backgroundColor: `${modelColors[model].replace('1)', '0.2)')}`,
+                        borderColor: modelColors[model],
+                        borderWidth: 2,
+                        pointBackgroundColor: modelColors[model],
+                        pointRadius: 3
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        r: {
+                            angleLines: { display: true },
+                            min: 0
+                        }
+                    }
+                }
+            }
+        );
+    });
+}
+
+// 8. Individual Metric Analysis
+const metricComparisonContainer = document.getElementById('metricComparisonCharts');
+if (visualizationData.metric_comparisons) {
+    Object.keys(visualizationData.metric_comparisons).forEach(metric => {
+        const metricData = visualizationData.metric_comparisons[metric];
+        
+        const colDiv = document.createElement('div');
+        colDiv.className = 'col-md-4 mb-4';
+        
+        const canvasContainer = document.createElement('div');
+        canvasContainer.className = 'chart-container';
+        
+        const canvas = document.createElement('canvas');
+        canvas.id = `metricChart_${metric}`;
+        
+        canvasContainer.appendChild(canvas);
+        colDiv.appendChild(document.createElement('h5')).textContent = metricData.title;
+        colDiv.appendChild(canvasContainer);
+        metricComparisonContainer.appendChild(colDiv);
+
+        new Chart(
+            canvas.getContext('2d'),
+            {
+                type: 'bar',
+                data: {
+                    labels: metricData.models,
+                    datasets: [{
+                        label: metric,
+                        data: metricData.values,
+                        backgroundColor: metricData.models.map(model => modelColors[model]),
+                        borderColor: 'rgba(0, 0, 0, 1)',
+                        borderWidth: 1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: { beginAtZero: true }
+                    }
+                }
+            }
+        );
+    });
+}
+// 9. Individual Feature Analysis
+        const featureAnalysisContainer = document.getElementById('featureAnalysisCharts');
+        
+        if (visualizationData.feature_analyses) {
+            Object.keys(visualizationData.feature_analyses).forEach(model => {
+                const featureData = visualizationData.feature_analyses[model];
+                
+                // Create canvas element for this chart
+                const colDiv = document.createElement('div');
+                colDiv.className = 'col-md-4 mb-4';
+                
+                const canvasContainer = document.createElement('div');
+                canvasContainer.className = 'chart-container';
+                
+                const canvas = document.createElement('canvas');
+                canvas.id = `featureChart_${model}`;
+                
+                canvasContainer.appendChild(canvas);
+                colDiv.appendChild(document.createElement('h5')).textContent = featureData.title;
+                colDiv.appendChild(canvasContainer);
+                featureAnalysisContainer.appendChild(colDiv);
+                
+                // Create horizontal bar chart for this model's features
+                new Chart(
+                    canvas.getContext('2d'),
+                    {
+                        type: 'bar',
+                        data: {
+                            labels: featureData.features,
+                            datasets: [{
+                                label: 'Importance',
+                                data: featureData.importance,
+                                backgroundColor: modelColors[model],
+                                borderColor: 'rgba(0, 0, 0, 1)',
+                                borderWidth: 1
+                            }]
+                        },
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            indexAxis: 'y',
+                            scales: {
+                                x: {
+                                    beginAtZero: true
+                                }
+                            }
+                        }
+                    }
+                );
+            });
+        }
+    </script>
 </body>
 </html>
 '''
@@ -568,32 +1010,35 @@ error_html = '''
 <head>
     <title>Error</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0-alpha1/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { padding: 20px; }
+        .container { max-width: 960px; }
+    </style>
 </head>
 <body>
-    <div class="container mt-5">
-        <div class="alert alert-danger">
-            <h4>Error</h4>
+    <div class="container">
+        <div class="alert alert-danger" role="alert">
+            <h4 class="alert-heading">Error!</h4>
             <p>{{ error }}</p>
         </div>
-        <a href="/" class="btn btn-primary">Back to Home</a>
+        <div class="text-center">
+            <a href="/" class="btn btn-primary">Back to Input Form</a>
+        </div>
     </div>
 </body>
 </html>
 '''
+# Write templates to files
+with open('templates/index.html', 'w') as f:
+    f.write(index_html)
 
-# Write template files if they don't exist
-if not os.path.exists('templates/index.html'):
-    with open('templates/index.html', 'w') as f:
-        f.write(index_html)
+with open('templates/results.html', 'w') as f:
+    f.write(results_html)
 
-if not os.path.exists('templates/results.html'):
-    with open('templates/results.html', 'w') as f:
-        f.write(results_html)
+with open('templates/error.html', 'w') as f:
+    f.write(error_html)
 
-if not os.path.exists('templates/error.html'):
-    with open('templates/error.html', 'w') as f:
-        f.write(error_html)
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 9000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=False)
