@@ -28,10 +28,22 @@ def home():
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        # Load necessary files with exact filenames
+        # Check if files exist
+        if not os.path.exists("scaler.pkl"):
+            return {"error": "scaler.pkl not found in deployment"}, 500
+        if not os.path.exists("label_encoder.pkl"):
+            return {"error": "label_encoder.pkl not found in deployment"}, 500
+        if not os.path.exists("model_performance_metrics.csv"):
+            return {"error": "model_performance_metrics.csv not found in deployment"}, 500
+        
+        # Load files
         scaler = joblib.load("scaler.pkl")
         label_encoder = joblib.load("label_encoder.pkl")
         metrics_df = pd.read_csv("model_performance_metrics.csv", index_col=0)
+        
+        return {"message": "Files loaded successfully"}
+    except Exception as e:
+        return {"error": str(e)}, 500
         
         # Convert Accuracy column to percentage
         metrics_df["Accuracy"] = (metrics_df["Accuracy"] * 100).round(2)
