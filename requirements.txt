@@ -6,3 +6,4 @@ joblib
 scikit-learn
 matplotlib
 seaborn
+lightgbm
