@@ -1,0 +1,17 @@
+Feature,Importance
+pm25,323
+pm10,349
+no,100
+no2,162
+nox,133
+nh3,207
+so2,280
+co,112
+o3,200
+benzene,94
+humidity,173
+wind_speed,96
+wind_direction,236
+solar_radiation,313
+rainfall,109
+air_temperature,113
